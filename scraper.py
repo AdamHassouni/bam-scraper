@@ -1,11 +1,12 @@
-
-
-import os, re, sys, time, hashlib, sqlite3, io
+import os, re, sys, hashlib, sqlite3, io
 from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 
+# -----------------------------
+# Config
+# -----------------------------
 PAGE_URL = "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/Marche-des-bons-de-tresor/Marche-secondaire/Taux-de-reference-des-bons-du-tresor"
 USER_AGENT = "Mozilla/5.0 (compatible; BKAM-Scraper/1.0; +https://example.org)"
 DB_PATH = os.environ.get("BKAM_DB", "bkam_state.sqlite")
@@ -17,7 +18,11 @@ TELEGRAM_CHAT_ID   = os.environ.get("TG_CHAT_ID")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
+# -----------------------------
+# Notifications
+# -----------------------------
 def notify(msg: str):
+    """Send a Telegram notification if credentials exist"""
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
             requests.post(
@@ -28,6 +33,9 @@ def notify(msg: str):
         except Exception:
             pass
 
+# -----------------------------
+# DB state
+# -----------------------------
 def get_db():
     con = sqlite3.connect(DB_PATH)
     con.execute("""CREATE TABLE IF NOT EXISTS seen (
@@ -37,11 +45,11 @@ def get_db():
     )""")
     return con
 
-def get_seen_hash(con, key="reference_csv_hash"):
+def get_seen_hash(con, key: str) -> str | None:
     row = con.execute("SELECT value FROM seen WHERE key=?", (key,)).fetchone()
     return row[0] if row else None
 
-def set_seen_hash(con, value, key="reference_csv_hash"):
+def set_seen_hash(con, value: str, key: str):
     con.execute("REPLACE INTO seen(key, value, ts) VALUES(?,?,?)",
                 (key, value, datetime.now(timezone.utc).isoformat()))
     con.commit()
@@ -49,96 +57,104 @@ def set_seen_hash(con, value, key="reference_csv_hash"):
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
-def find_csv_link(html: str) -> str | None:
+# -----------------------------
+# Scraping
+# -----------------------------
+def fetch_reference_page() -> str:
+    """Fetch BKAM reference page HTML"""
+    r = requests.get(PAGE_URL, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.text
+
+def extract_csv_url(html: str) -> str | None:
+    """Find candidate CSV download link in page HTML"""
     soup = BeautifulSoup(html, "html.parser")
-    candidates = []
     for a in soup.find_all("a", href=True):
         text = (a.get_text() or "").strip().lower()
         href = a["href"]
         if "csv" in href.lower() or "csv" in text:
             if "telechargement" in text or "download" in text or href.lower().endswith(".csv"):
-                candidates.append(href)
-    if not candidates:
-        return None
-    csv_href = candidates[0]
-    if csv_href.startswith("http"):
-        return csv_href
-    from urllib.parse import urljoin
-    return urljoin(PAGE_URL, csv_href)
+                from urllib.parse import urljoin
+                return href if href.startswith("http") else urljoin(PAGE_URL, href)
+    return None
 
-def fetch(url: str) -> requests.Response:
-    return requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+def download_csv(csv_url: str) -> bytes | None:
+    """Try to download CSV and validate"""
+    r = requests.get(csv_url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+    if r.status_code == 200 and "csv" in r.headers.get("Content-Type","").lower():
+        return r.content
+    head = r.content[:256].decode("utf-8", errors="ignore")
+    if "," in head or ";" in head:
+        return r.content
+    return None
 
-def parse_table_from_html(html: str) -> pd.DataFrame:
+def parse_reference_table(html: str) -> pd.DataFrame:
+    """Fallback: parse HTML table if no CSV available"""
     dfs = pd.read_html(html, flavor="bs4")
     dfs.sort(key=lambda df: df.shape[1], reverse=True)
     return dfs[0]
 
-def save_artifacts(df: pd.DataFrame, raw_bytes: bytes | None, tag: str):
+# -----------------------------
+# Saving
+# -----------------------------
+def save_reference_data(df: pd.DataFrame, raw_bytes: bytes | None, tag: str) -> str:
+    """Save raw + clean CSV, return path of clean file"""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if raw_bytes is not None:
-        csv_path = os.path.join(OUT_DIR, f"bkam_reference_rates_raw_{tag}_{ts}.csv")
-        with open(csv_path, "wb") as f:
+        raw_path = os.path.join(OUT_DIR, f"bkam_raw_{tag}_{ts}.csv")
+        with open(raw_path, "wb") as f:
             f.write(raw_bytes)
-    else:
-        csv_path = os.path.join(OUT_DIR, f"bkam_reference_rates_parsed_{tag}_{ts}.csv")
-        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-
     clean = df.copy()
     clean.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in clean.columns]
-    clean_path = os.path.join(OUT_DIR, f"bkam_reference_rates_clean_{tag}_{ts}.csv")
+    clean_path = os.path.join(OUT_DIR, f"bkam_clean_{tag}_{ts}.csv")
     clean.to_csv(clean_path, index=False, encoding="utf-8-sig")
-    return csv_path, clean_path
+    return clean_path
 
-def main():
+# -----------------------------
+# Main update logic
+# -----------------------------
+def update_reference_data(dedupe: bool = True) -> str | None:
+    """
+    Scrape BAM website, save CSV(s).
+    Returns: path to CLEAN CSV if updated, else None.
+    """
     con = get_db()
-    r = fetch(PAGE_URL)
-    r.raise_for_status()
-    html = r.text
+    html = fetch_reference_page()
 
-    csv_url = find_csv_link(html)
-    raw_bytes = None
-    tag = "csv"
+    # Try CSV first
+    csv_url = extract_csv_url(html)
     if csv_url:
-        r_csv = fetch(csv_url)
-        if r_csv.status_code == 200 and r_csv.headers.get("Content-Type","").lower().find("csv") != -1:
-            raw_bytes = r_csv.content
-        else:
-            content = r_csv.content
-            head = content[:256].decode("utf-8", errors="ignore")
-            if "," in head or ";" in head:
-                raw_bytes = content
+        raw_bytes = download_csv(csv_url)
+        if raw_bytes:
+            current_hash = sha256_bytes(raw_bytes)
+            last_hash = get_seen_hash(con, key="reference_csv_hash")
+            if dedupe and last_hash == current_hash:
+                print("No change detected (CSV).")
+                return None
+            df = pd.read_csv(io.BytesIO(raw_bytes))
+            clean_path = save_reference_data(df, raw_bytes, tag="csv")
+            set_seen_hash(con, current_hash, key="reference_csv_hash")
+            notify(f"BKAM T-Bond reference rates UPDATED (CSV). Saved: {clean_path}")
+            return clean_path
 
-    if raw_bytes is not None:
-        current_hash = sha256_bytes(raw_bytes)
-        last_hash = get_seen_hash(con)
-        if last_hash == current_hash:
-            print("No change detected (CSV).")
-            return
-        df = pd.read_csv(io.BytesIO(raw_bytes))
-        csv_path, clean_path = save_artifacts(df, raw_bytes, tag="csv")
-        set_seen_hash(con, current_hash)
-        msg = f"BKAM T-Bond reference rates UPDATED (CSV). Saved:\n{csv_path}\n{clean_path}"
-        print(msg)
-        notify(msg)
-        return
-
-    df = parse_table_from_html(html)
+    # Fallback to HTML
+    df = parse_reference_table(html)
     table_bytes = df.to_csv(index=False).encode("utf-8")
     current_hash = sha256_bytes(table_bytes)
     last_hash = get_seen_hash(con, key="reference_html_hash")
-    if last_hash == current_hash:
-        print("No change detected (HTML table).")
-        return
-    csv_path, clean_path = save_artifacts(df, raw_bytes=None, tag="html")
+    if dedupe and last_hash == current_hash:
+        print("No change detected (HTML).")
+        return None
+    clean_path = save_reference_data(df, raw_bytes=None, tag="html")
     set_seen_hash(con, current_hash, key="reference_html_hash")
-    msg = f"BKAM T-Bond reference rates UPDATED (HTML). Saved:\n{csv_path}\n{clean_path}"
-    print(msg)
-    notify(msg)
+    notify(f"BKAM T-Bond reference rates UPDATED (HTML). Saved: {clean_path}")
+    return clean_path
 
 if __name__ == "__main__":
     try:
-        main()
+        updated_file = update_reference_data()
+        if updated_file:
+            print(f"[INFO] New data saved at {updated_file}")
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         notify(f"[ERROR] BKAM scraper: {e}")
